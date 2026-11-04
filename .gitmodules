@@ -1,0 +1,6 @@
+[submodule "skills/OpenSpec"]
+	path = skills/OpenSpec
+	url = https://github.com/Fission-AI/OpenSpec.git
+[submodule "skills/superpowers"]
+	path = skills/superpowers
+	url = https://github.com/obra/superpowers.git

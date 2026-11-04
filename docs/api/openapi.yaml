@@ -1,0 +1,2859 @@
+openapi: 3.1.0
+info:
+  title: 反诈信息核验与风险解释系统 API
+  version: 1.0.0
+  description: |
+    后续 FastAPI 业务实现的统一契约。P0/P1/P2 接口集中在此文档。
+    所有耗时业务首版同步返回；超时返回真实资源 ID，不伪造完成。
+    风险分、风险等级、操作键和资源所有者只能由服务端生成。
+servers:
+  - url: http://localhost:8000
+    description: 后续业务服务；独立文档预览入口不实现这些业务路由
+tags:
+  - {name: Auth, description: P0 认证}
+  - {name: Verification, description: P0/P1 核验、轨迹和解释}
+  - {name: Knowledge, description: P0 知识库与案例运营}
+  - {name: Rules, description: P0 规则草稿、版本与发布}
+  - {name: Lists, description: P0 黑白名单版本}
+  - {name: Configuration, description: P0 阈值、语义和变形词表}
+  - {name: Feedback, description: P0 反馈与审计}
+  - {name: Dashboard, description: P0 管理看板}
+  - {name: Attack, description: P1 基础攻防与攻防智能体}
+  - {name: Agent, description: P2 消息智能体}
+
+paths:
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: OAuth2 密码登录
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [username, password]
+              properties:
+                username: {type: string, minLength: 1, maxLength: 64}
+                password: {type: string, minLength: 1, maxLength: 256, format: password}
+                grant_type: {type: string, const: password, default: password}
+                scope: {type: string, default: ""}
+                client_id: {type: string}
+                client_secret: {type: string, format: password}
+      responses:
+        "200":
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data: {$ref: "#/components/schemas/TokenResult"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/verify:
+    post:
+      tags: [Verification]
+      operationId: verifyContent
+      summary: 匿名同步单条核验
+      description: fast 不调用 LLM；enhanced 增加 LLM 意图识别。trace_token 仅在创建响应中返回。
+      security: []
+      requestBody: {$ref: "#/components/requestBodies/VerificationRequest"}
+      responses:
+        "200":
+          description: 核验完成，可能包含明确的降级信息
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VerificationResponse"}
+              example:
+                code: OK
+                data:
+                  trace_id: 6f0579c4-2ea2-4df0-8977-9d9919ee366f
+                  trace_token: example-token-000000000000000000000000
+                  content_type: sms
+                  mode: fast
+                  fraud_type: unknown
+                  total_score: 0
+                  risk_level: 安全
+                  rule_score: 0
+                  semantic_score: 0
+                  hits: []
+                  explanation: 未命中风险规则，当前判定为安全；仍请通过官方渠道核实。
+                  degraded: []
+                  versions:
+                    rule_version: rules-v1
+                    rule_release_id: 6f0579c4-2ea2-4df0-8977-9d9919ee366f
+                    threshold_version: thresholds-v1
+                    semantic_config_version: semantic-v1
+                    transform_dict_version: transforms-v1
+                    list_version: lists-v1
+                    retriever_version: retriever-v1
+                  created_at: "2026-11-03T08:00:00Z"
+                degraded: []
+                trace_id: 6f0579c4-2ea2-4df0-8977-9d9919ee366f
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+        "504": {$ref: "#/components/responses/Timeout"}
+
+  /api/verify/batch:
+    post:
+      tags: [Verification]
+      operationId: verifyBatch
+      summary: 匿名同步批量核验
+      description: CSV/TXT 最大 2MB、最多 1000 条；单条失败不终止整批。完成响应和 504 details 均携带 batch_token。
+      security: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  maxLength: 2097152
+                  description: CSV/TXT，解析后条目数必须为 1–1000
+                mode: {$ref: "#/components/schemas/VerifyMode"}
+            encoding:
+              file: {contentType: text/csv}
+      responses:
+        "200":
+          description: 本批处理结束，含逐条失败时仍按对账结果返回
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data: {$ref: "#/components/schemas/BatchResult"}
+        "413": {$ref: "#/components/responses/PayloadTooLarge"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+        "504":
+          description: 同步超时，返回可恢复查询的 batch_id 和 batch_token
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BatchTimeoutError"}
+
+  /api/verify/batch/{batch_id}:
+    get:
+      tags: [Verification]
+      operationId: getBatch
+      summary: 查询批量部分或最终结果
+      security: [{batchToken: []}]
+      parameters: [{$ref: "#/components/parameters/BatchId"}]
+      responses:
+        "200":
+          description: 当前批量结果，不重复发放任何 capability token
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data: {$ref: "#/components/schemas/BatchDetail"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/verify/{trace_id}:
+    get:
+      tags: [Verification]
+      operationId: getVerificationTrace
+      summary: 匿名凭 trace_token 回放轨迹
+      security: [{traceToken: []}]
+      parameters: [{$ref: "#/components/parameters/TraceId"}]
+      responses:
+        "200":
+          description: 不可变判定轨迹
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data: {$ref: "#/components/schemas/JudgmentTrace"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/verify/{trace_id}/explanation:
+    post:
+      tags: [Verification]
+      operationId: explainVerification
+      summary: P1 同步生成双视角解释
+      security: [{traceToken: []}]
+      parameters: [{$ref: "#/components/parameters/TraceId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [view]
+              properties:
+                view: {type: string, enum: [user, technical]}
+      responses:
+        "200":
+          description: 解释完成；生成失败时回退模板并保留校验状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data: {$ref: "#/components/schemas/ExplanationRecord"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+        "504": {$ref: "#/components/responses/Timeout"}
+
+  /api/admin/traces/{trace_id}:
+    get:
+      tags: [Feedback]
+      operationId: getAdminTrace
+      summary: 运营读取判定轨迹
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/TraceId"}]
+      responses:
+        "200":
+          description: 反馈处理所需轨迹
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data: {$ref: "#/components/schemas/JudgmentTrace"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/knowledge/types:
+    get:
+      tags: [Knowledge]
+      operationId: listKnowledgeTypes
+      summary: 浏览有上线案例的分类
+      security: []
+      responses:
+        "200": {$ref: "#/components/schemas/KnowledgeTypeListResponse"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/knowledge/cases:
+    get:
+      tags: [Knowledge]
+      operationId: listKnowledgeCases
+      summary: 匿名分页浏览上线案例
+      security: []
+      parameters:
+        - {name: fraud_type, in: query, schema: {type: string, maxLength: 64}}
+        - {name: keyword, in: query, schema: {type: string, maxLength: 100}}
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/CasePageResponse"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/knowledge/cases/{case_id}:
+    get:
+      tags: [Knowledge]
+      operationId: getKnowledgeCase
+      summary: 匿名读取上线案例
+      security: []
+      parameters: [{$ref: "#/components/parameters/CaseId"}]
+      responses:
+        "200": {$ref: "#/components/schemas/CaseResponse"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/admin/knowledge/cases:
+    get:
+      tags: [Knowledge]
+      operationId: listAdminCases
+      summary: 运营浏览全部案例
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [draft, published, archived]}}
+        - {name: fraud_type, in: query, schema: {type: string}}
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/CasePageResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+    post:
+      tags: [Knowledge]
+      operationId: createCase
+      summary: 运营创建案例
+      security: [{bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/CaseRequest"}
+      responses:
+        "201": {$ref: "#/components/schemas/CaseResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/admin/knowledge/cases/{case_id}:
+    patch:
+      tags: [Knowledge]
+      operationId: updateCase
+      summary: 修订案例或上下线
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/CaseId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CaseUpdate"}
+      responses:
+        "200": {$ref: "#/components/schemas/CaseResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/rules:
+    get:
+      tags: [Rules]
+      operationId: listRules
+      summary: 查询规则及草稿状态
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: enabled, in: query, schema: {type: boolean}}
+        - {name: fraud_type, in: query, schema: {type: string}}
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/RulePageResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+    post:
+      tags: [Rules]
+      operationId: createRule
+      summary: 创建规则身份和初始草稿
+      description: 不直接生效；必须继续创建不可变版本和完整 release。
+      security: [{bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/RuleDefinition"}
+      responses:
+        "201": {$ref: "#/components/schemas/RuleResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/rules/{rule_id}:
+    get:
+      tags: [Rules]
+      operationId: getRule
+      summary: 读取规则、草稿及版本摘要
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/RuleId"}]
+      responses:
+        "200": {$ref: "#/components/schemas/RuleResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+    delete:
+      tags: [Rules]
+      operationId: deleteRule
+      summary: 软删除规则身份
+      description: 不删除历史版本；生效集合的移除仍须新 release。
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/RuleId"}]
+      responses:
+        "200": {$ref: "#/components/schemas/RuleResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/rules/{rule_id}/draft:
+    put:
+      tags: [Rules]
+      operationId: updateRuleDraft
+      summary: 按 revision 修改规则草稿
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/RuleId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RuleDraftUpdate"}
+      responses:
+        "200": {$ref: "#/components/schemas/RuleResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/rules/{rule_id}/versions:
+    get:
+      tags: [Rules]
+      operationId: listRuleVersions
+      summary: 查询不可变规则版本
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/RuleId"}
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/RuleVersionPageResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+    post:
+      tags: [Rules]
+      operationId: createRuleVersion
+      summary: 校验草稿并冻结为不可变版本
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/RuleId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RevisionRequest"}
+      responses:
+        "201": {$ref: "#/components/schemas/RuleVersionResponse"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/rule-releases:
+    get:
+      tags: [Rules]
+      operationId: listRuleReleases
+      summary: 分页查询发布单
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [draft, active, archived]}}
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/RuleReleasePageResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+    post:
+      tags: [Rules]
+      operationId: createRuleRelease
+      summary: 创建完整规则快照并检测冲突
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RuleReleaseCreate"}
+      responses:
+        "201": {$ref: "#/components/schemas/RuleReleaseResponse"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/rule-releases/{version}:
+    get:
+      tags: [Rules]
+      operationId: getRuleRelease
+      summary: 读取发布快照
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/Version"}]
+      responses:
+        "200": {$ref: "#/components/schemas/RuleReleaseResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/rule-releases/{version}/conflicts:
+    get:
+      tags: [Rules]
+      operationId: listRuleConflicts
+      summary: 查询规则冲突
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/Version"}]
+      responses:
+        "200": {$ref: "#/components/schemas/RuleConflictPageResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/rule-releases/{version}/conflicts/{conflict_id}/resolution:
+    post:
+      tags: [Rules]
+      operationId: resolveRuleConflict
+      summary: 记录冲突解决或人工豁免
+      description: confirmed 和 needs_review 均阻断激活；豁免必须保留理由和审计。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/Version"}
+        - {name: conflict_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ConflictResolution"}
+      responses:
+        "200": {$ref: "#/components/schemas/RuleConflictResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/rule-releases/{version}/activate:
+    post:
+      tags: [Rules]
+      operationId: activateRuleRelease
+      summary: 原子激活规则发布单
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/Version"}]
+      requestBody: {$ref: "#/components/requestBodies/ActivationRequest"}
+      responses:
+        "200": {$ref: "#/components/schemas/RuleReleaseResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/lists/active:
+    get:
+      tags: [Lists]
+      operationId: getActiveList
+      summary: 读取当前名单版本
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/ListReleaseResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/lists/draft:
+    get:
+      tags: [Lists]
+      operationId: getListDraft
+      summary: 读取名单草稿
+      security: [{bearerAuth: []}]
+      responses:
+        "200": {$ref: "#/components/schemas/ListReleaseResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+    put:
+      tags: [Lists]
+      operationId: updateListDraft
+      summary: 全量替换名单草稿
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ListDraftUpdate"}
+      responses:
+        "200": {$ref: "#/components/schemas/ListReleaseResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/list-releases:
+    post:
+      tags: [Lists]
+      operationId: createListRelease
+      summary: 冻结名单草稿
+      security: [{bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/RevisionRequest"}
+      responses:
+        "201": {$ref: "#/components/schemas/ListReleaseResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/list-releases/{version}/activate:
+    post:
+      tags: [Lists]
+      operationId: activateListRelease
+      summary: 激活名单版本
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/Version"}]
+      requestBody: {$ref: "#/components/requestBodies/ActivationRequest"}
+      responses:
+        "200": {$ref: "#/components/schemas/ListReleaseResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/threshold-config/active:
+    get:
+      tags: [Configuration]
+      operationId: getActiveThresholdConfig
+      summary: 读取当前阈值
+      security: [{bearerAuth: []}]
+      responses:
+        "200": {$ref: "#/components/schemas/ThresholdConfigResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/threshold-config:
+    post:
+      tags: [Configuration]
+      operationId: createThresholdConfig
+      summary: 新建阈值版本
+      description: 0 < low_min < medium_min < high_min <= 100。
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ThresholdConfigInput"}
+      responses:
+        "201": {$ref: "#/components/schemas/ThresholdConfigResponse"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/threshold-config/{version}/activate:
+    post:
+      tags: [Configuration]
+      operationId: activateThresholdConfig
+      summary: 激活阈值版本
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/Version"}]
+      requestBody: {$ref: "#/components/requestBodies/ActivationRequest"}
+      responses:
+        "200": {$ref: "#/components/schemas/ThresholdConfigResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/semantic-config/active:
+    get:
+      tags: [Configuration]
+      operationId: getActiveSemanticConfig
+      summary: 读取当前语义配置
+      security: [{bearerAuth: []}]
+      responses:
+        "200": {$ref: "#/components/schemas/SemanticConfigResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/semantic-config:
+    post:
+      tags: [Configuration]
+      operationId: createSemanticConfig
+      summary: 新建语义配置版本
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SemanticConfigInput"}
+      responses:
+        "201": {$ref: "#/components/schemas/SemanticConfigResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/semantic-config/{version}/activate:
+    post:
+      tags: [Configuration]
+      operationId: activateSemanticConfig
+      summary: 激活语义配置版本
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/Version"}]
+      requestBody: {$ref: "#/components/requestBodies/ActivationRequest"}
+      responses:
+        "200": {$ref: "#/components/schemas/SemanticConfigResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/transform-dictionaries/active:
+    get:
+      tags: [Configuration]
+      operationId: getActiveTransformDictionary
+      summary: 读取当前变形词表
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/TransformDictionaryResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/transform-dictionaries/draft:
+    get:
+      tags: [Configuration]
+      operationId: getTransformDictionaryDraft
+      summary: 读取变形词表草稿
+      security: [{bearerAuth: []}]
+      responses:
+        "200": {$ref: "#/components/schemas/TransformDictionaryResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+    put:
+      tags: [Configuration]
+      operationId: updateTransformDictionaryDraft
+      summary: 全量更新变形词表草稿
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TransformDictionaryUpdate"}
+      responses:
+        "200": {$ref: "#/components/schemas/TransformDictionaryResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/transform-dictionary-releases:
+    post:
+      tags: [Configuration]
+      operationId: createTransformDictionaryRelease
+      summary: 冻结变形词表版本
+      security: [{bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/RevisionRequest"}
+      responses:
+        "201": {$ref: "#/components/schemas/TransformDictionaryResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/transform-dictionary-releases/{version}/activate:
+    post:
+      tags: [Configuration]
+      operationId: activateTransformDictionaryRelease
+      summary: 激活变形词表版本
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/Version"}]
+      requestBody: {$ref: "#/components/requestBodies/ActivationRequest"}
+      responses:
+        "200": {$ref: "#/components/schemas/TransformDictionaryResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/feedback:
+    post:
+      tags: [Feedback]
+      operationId: createFeedback
+      summary: 凭 trace_token 标记误报或漏报
+      security: [{traceToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/FeedbackCreate"}
+      responses:
+        "201": {$ref: "#/components/schemas/FeedbackResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/admin/feedback:
+    get:
+      tags: [Feedback]
+      operationId: listFeedback
+      summary: 查询反馈队列
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [pending, resolved]}}
+        - {name: kind, in: query, schema: {type: string, enum: [false_positive, false_negative]}}
+        - {name: start, in: query, schema: {type: string, format: date-time}}
+        - {name: end, in: query, schema: {type: string, format: date-time}}
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/FeedbackPageResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/admin/feedback/{feedback_id}:
+    patch:
+      tags: [Feedback]
+      operationId: resolveFeedback
+      summary: 处理反馈
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: feedback_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [revision, status]
+              properties:
+                revision: {type: integer, minimum: 1}
+                status: {type: string, const: resolved}
+                note: {type: string, maxLength: 2000}
+      responses:
+        "200": {$ref: "#/components/schemas/FeedbackResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/admin/dashboard:
+    get:
+      tags: [Dashboard]
+      operationId: getDashboard
+      summary: 查询检测、风险和规则命中统计
+      description: 规则命中只统计 matched=true；返回分子和分母供复核。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: start, in: query, required: true, schema: {type: string, format: date-time}}
+        - {name: end, in: query, required: true, schema: {type: string, format: date-time}}
+      responses:
+        "200": {$ref: "#/components/schemas/DashboardResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/admin/audit-logs:
+    get:
+      tags: [Feedback]
+      operationId: listAuditLogs
+      summary: 只读查询运营审计
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: resource_type, in: query, schema: {type: string}}
+        - {name: resource_id, in: query, schema: {type: string}}
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/AuditLogPageResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/attack/sample-sets:
+    get:
+      tags: [Attack]
+      operationId: listAttackSampleSets
+      summary: 查询攻防样本集
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [draft, frozen, archived]}}
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/SampleSetPageResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+    post:
+      tags: [Attack]
+      operationId: createAttackSampleSet
+      summary: 创建原始样本集
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SampleSetCreate"}
+      responses:
+        "201": {$ref: "#/components/schemas/SampleSetResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/attack/sample-sets/{version}:
+    get:
+      tags: [Attack]
+      operationId: getAttackSampleSet
+      summary: 读取样本集及分页样本
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/Version"}
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/SampleSetDetailResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/attack/sample-sets/{version}/variants:
+    post:
+      tags: [Attack]
+      operationId: generateAttackVariants
+      summary: 同步生成变体样本的新版本
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/Version"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/VariantRequest"}
+      responses:
+        "201": {$ref: "#/components/schemas/SampleSetResponse"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+        "504": {$ref: "#/components/responses/Timeout"}
+
+  /api/attack/sample-sets/{version}/injections:
+    post:
+      tags: [Attack]
+      operationId: generateAttackInjections
+      summary: 同步生成注入样本的新版本
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/Version"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/InjectionRequest"}
+      responses:
+        "201": {$ref: "#/components/schemas/SampleSetResponse"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+        "504": {$ref: "#/components/responses/Timeout"}
+
+  /api/attack/sample-sets/{version}/freeze:
+    post:
+      tags: [Attack]
+      operationId: freezeAttackSampleSet
+      summary: 冻结完整样本集
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: "#/components/parameters/Version"}]
+      requestBody: {$ref: "#/components/requestBodies/RevisionRequest"}
+      responses:
+        "200": {$ref: "#/components/schemas/SampleSetResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/attack/replays:
+    post:
+      tags: [Attack]
+      operationId: createAdHocReplay
+      summary: 同步执行 ad_hoc 单臂回放
+      description: 仅用于临时单臂实验；E3/E4/E5 必须调用 comparisons。
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReplayCreate"}
+      responses:
+        "200":
+          description: 单臂回放处理结束
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data: {$ref: "#/components/schemas/ReplayRun"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+        "504": {$ref: "#/components/responses/Timeout"}
+
+  /api/attack/replays/{replay_run_id}:
+    get:
+      tags: [Attack]
+      operationId: getAttackReplay
+      summary: 查询回放和逐条结果
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: replay_run_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200": {$ref: "#/components/schemas/ReplayRunResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/attack/replays/{replay_run_id}/blindspots:
+    get:
+      tags: [Attack]
+      operationId: getReplayBlindspots
+      summary: 查询盲区矩阵
+      description: 检出率由 detected_count/total_count 派生，失败样本不按未检出统计。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: replay_run_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200":
+          description: 按骗局类型和攻击手法分组的矩阵
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: {$ref: "#/components/schemas/BlindspotCell"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/attack/replays/{replay_run_id}/rule-drafts:
+    post:
+      tags: [Attack]
+      operationId: createRuleSuggestion
+      summary: 根据漏检样本生成待审核建议
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: replay_run_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RuleSuggestionCreate"}
+      responses:
+        "201": {$ref: "#/components/schemas/RuleDraftResponse"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+        "504": {$ref: "#/components/responses/Timeout"}
+
+  /api/attack/comparisons:
+    post:
+      tags: [Attack]
+      operationId: createAttackComparison
+      summary: 同步执行完整 E3/E4/E5 对照
+      description: 一次定义全部实验臂；服务端校验除实验自变量外的配置一致，返回 comparison_id 和各臂 replay_run_id。
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ComparisonCreate"}
+      responses:
+        "200":
+          description: 对照处理结束，含真实降级或失败状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data: {$ref: "#/components/schemas/Comparison"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+        "504": {$ref: "#/components/responses/Timeout"}
+
+  /api/attack/comparisons/{comparison_id}:
+    get:
+      tags: [Attack]
+      operationId: getAttackComparison
+      summary: 查询对照、配对和指标
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: comparison_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200": {$ref: "#/components/schemas/ComparisonResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/attack/rule-drafts:
+    get:
+      tags: [Attack]
+      operationId: listAttackRuleDrafts
+      summary: 查询规则迭代建议
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [pending, accepted, rejected, approved]}}
+        - {$ref: "#/components/parameters/Page"}
+        - {$ref: "#/components/parameters/PageSize"}
+      responses:
+        "200": {$ref: "#/components/schemas/RuleDraftPageResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/attack/rule-drafts/{draft_id}/review:
+    post:
+      tags: [Attack]
+      operationId: reviewAttackRuleDraft
+      summary: 人工审核规则建议
+      description: accept 只创建 M5 规则草稿并置 accepted；最终发布后才置 approved，建议绝不直接生效。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: draft_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RuleDraftReview"}
+      responses:
+        "200": {$ref: "#/components/schemas/RuleDraftResponse"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/attack/campaigns:
+    post:
+      tags: [Attack]
+      operationId: createAttackCampaign
+      summary: 创建并同步执行攻防智能体活动
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CampaignCreate"}
+      responses:
+        "200": {$ref: "#/components/schemas/CampaignResponse"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+        "429": {$ref: "#/components/responses/ValidationError"}
+        "504": {$ref: "#/components/responses/Timeout"}
+
+  /api/attack/campaigns/{campaign_id}:
+    get:
+      tags: [Attack]
+      operationId: getAttackCampaign
+      summary: 查询活动、轮次、样本版本与回放
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: campaign_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200": {$ref: "#/components/schemas/CampaignResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/agent/sessions:
+    post:
+      tags: [Agent]
+      operationId: createAgentSession
+      summary: P2 创建匿名或登录消息会话
+      description: 匿名会话只在响应中返回一次不透明 session_token。
+      security: [{bearerAuth: []}, {}]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AgentSessionCreate"}
+      responses:
+        "201":
+          description: 会话创建成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data: {$ref: "#/components/schemas/AgentSession"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/agent/sessions/{session_id}:
+    get:
+      tags: [Agent]
+      operationId: getAgentSession
+      summary: 读取当前访问者的会话
+      security: [{agentSessionToken: []}, {bearerAuth: []}]
+      parameters:
+        - {name: session_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200": {$ref: "#/components/schemas/AgentSessionDetailResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/agent/sessions/{session_id}/messages:
+    post:
+      tags: [Agent]
+      operationId: sendAgentMessage
+      summary: 同步发送消息并运行消息智能体
+      description: 对话意图仅负责工具路由；verification_results 由后端从真实工具结果组装。
+      security: [{agentSessionToken: []}, {bearerAuth: []}]
+      parameters:
+        - {name: session_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AgentMessageRequest"}
+      responses:
+        "200":
+          description: 运行结束，可能含明确降级
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiSuccess"
+                  - type: object
+                    properties:
+                      data: {$ref: "#/components/schemas/AgentMessageResponse"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+        "429": {$ref: "#/components/responses/ValidationError"}
+        "504": {$ref: "#/components/responses/Timeout"}
+
+  /api/agent/sessions/{session_id}/contents/{content_ref}/confirmation:
+    post:
+      tags: [Agent]
+      operationId: confirmAgentContent
+      summary: 确认或拒绝候选核验正文
+      description: 只有 confirmed 且属于当前会话的 content_ref 才能核验；确认后正文、类型和 span 不可变。
+      security: [{agentSessionToken: []}, {bearerAuth: []}]
+      parameters:
+        - {name: session_id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {name: content_ref, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ContentConfirmation"}
+      responses:
+        "200": {$ref: "#/components/schemas/AgentContentResponse"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+  /api/agent/runs/{run_id}:
+    get:
+      tags: [Agent]
+      operationId: getAgentRun
+      summary: 读取运行状态、工具审计摘要和降级
+      security: [{agentSessionToken: []}, {bearerAuth: []}]
+      parameters:
+        - {name: run_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200": {$ref: "#/components/schemas/AgentRunResponse"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationError"}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 运营接口需要 role=operator。
+    traceToken:
+      type: apiKey
+      in: header
+      name: X-Trace-Token
+      description: 单条核验或对应批量条目返回的匿名轨迹凭据；仅授权一个 trace_id。
+    batchToken:
+      type: apiKey
+      in: header
+      name: X-Batch-Token
+      description: 批量响应或 504 details 返回的匿名批量凭据。
+    agentSessionToken:
+      type: apiKey
+      in: header
+      name: X-Agent-Session-Token
+      description: 匿名消息会话凭据，不写入 URL。
+  parameters:
+    TraceId: {name: trace_id, in: path, required: true, schema: {type: string, format: uuid}}
+    BatchId: {name: batch_id, in: path, required: true, schema: {type: string, format: uuid}}
+    RuleId: {name: rule_id, in: path, required: true, schema: {type: string, pattern: "^R[0-9]+$", maxLength: 64}}
+    CaseId: {name: case_id, in: path, required: true, schema: {type: string, pattern: "^C[0-9]+$", maxLength: 32}}
+    Version: {name: version, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 64}}
+    Page: {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+    PageSize: {name: page_size, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+  requestBodies:
+    VerificationRequest:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/VerificationRequest"}
+          example: {content_type: sms, content: "【快递】您的包裹异常，请立即联系 400-000-0000", mode: fast}
+    CaseRequest:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/CaseInput"}
+    RuleDefinition:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/RuleDefinition"}
+    RevisionRequest:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/RevisionRequest"}
+    ActivationRequest:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ActivationRequest"}
+  responses:
+    DataSuccess:
+      description: 操作成功；data 为对应资源或分页对象
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ApiSuccess"}
+    BadRequest:
+      description: 业务输入不合法
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ApiError"}
+    Unauthorized:
+      description: 未认证、凭据失效或与资源不匹配
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ApiError"}
+    Forbidden:
+      description: 角色或资源所有权不允许
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ApiError"}
+    NotFound:
+      description: 资源不存在，或不暴露无权资源的存在
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ApiError"}
+    Conflict:
+      description: revision、active 版本、不可变状态或阻断冲突
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ApiError"}
+    ValidationError:
+      description: 请求格式、字段、枚举或条目数量校验失败
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ApiError"}
+    PayloadTooLarge:
+      description: 上传文件超过 2MB
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ApiError"}
+    Timeout:
+      description: 同步 deadline 到期；若已创建资源，details 包含真实查询 ID 和相应匿名凭据，不宣称完成
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ApiError"}
+  schemas:
+    ContentType: {type: string, enum: [sms, chat, url, phone]}
+    VerifyMode: {type: string, enum: [fast, enhanced], default: fast}
+    RiskLevel: {type: string, enum: [安全, 低风险, 中风险, 高风险]}
+    Uuid: {type: string, format: uuid}
+    DateTime: {type: string, format: date-time}
+    Version: {type: string, minLength: 1, maxLength: 64}
+    DegradedItem:
+      type: object
+      additionalProperties: false
+      required: [component, code, message]
+      properties:
+        component: {type: string, enum: [llm, retriever, agent, replay, storage]}
+        code: {type: string, minLength: 1, maxLength: 64}
+        message: {type: string, minLength: 1, maxLength: 500}
+    DegradedList:
+      type: array
+      items: {$ref: "#/components/schemas/DegradedItem"}
+      default: []
+    ApiSuccess:
+      type: object
+      additionalProperties: false
+      required: [code, data, degraded, trace_id]
+      properties:
+        code: {type: string, example: OK}
+        data: {}
+        degraded: {$ref: "#/components/schemas/DegradedList"}
+        trace_id: {type: [string, "null"], format: uuid}
+    ApiError:
+      type: object
+      additionalProperties: false
+      required: [code, message, details, degraded, trace_id]
+      properties:
+        code: {type: string, example: VALIDATION_ERROR}
+        message: {type: string, minLength: 1}
+        details:
+          type: object
+          description: 字段错误或部分完成资源信息；不含 SQL、堆栈和密钥。
+          additionalProperties: true
+        degraded: {$ref: "#/components/schemas/DegradedList"}
+        trace_id: {type: [string, "null"], format: uuid}
+    BatchTimeoutError:
+      allOf:
+        - $ref: "#/components/schemas/ApiError"
+        - type: object
+          properties:
+            details:
+              type: object
+              additionalProperties: false
+              required: [batch_id, batch_token]
+              properties:
+                batch_id: {type: string, format: uuid}
+                batch_token: {type: string, minLength: 32}
+    TokenResult:
+      type: object
+      additionalProperties: false
+      required: [access_token, token_type, expires_in, role]
+      properties:
+        access_token: {type: string, minLength: 20}
+        token_type: {type: string, const: bearer}
+        expires_in: {type: integer, minimum: 1}
+        role: {type: string, enum: [user, operator]}
+    VerificationRequest:
+      type: object
+      additionalProperties: false
+      required: [content_type, content]
+      properties:
+        content_type: {$ref: "#/components/schemas/ContentType"}
+        content: {type: string, minLength: 1, maxLength: 100000}
+        mode: {$ref: "#/components/schemas/VerifyMode"}
+    EvidenceSpan:
+      type: object
+      additionalProperties: false
+      required: [text, start, end]
+      properties:
+        text: {type: string, minLength: 1}
+        start: {type: integer, minimum: 0}
+        end: {type: integer, minimum: 1}
+      description: 服务端必须校验 text == original[start:end]。
+    RuleHit:
+      type: object
+      additionalProperties: false
+      required: [rule_id, rule_version, matched, participates_in_score, suppressed_by, weight, evidence, hit_order]
+      properties:
+        rule_id: {type: string, pattern: "^R[0-9]+$"}
+        rule_version: {type: string, format: uuid}
+        matched: {type: boolean}
+        participates_in_score: {type: boolean}
+        suppressed_by: {type: [string, "null"]}
+        weight: {type: integer, minimum: 0, maximum: 100}
+        evidence:
+          type: array
+          items: {$ref: "#/components/schemas/EvidenceSpan"}
+        hit_order: {type: integer, minimum: 0}
+    ScoreDetail:
+      type: object
+      additionalProperties: false
+      required: [rule_score, semantic_raw, semantic_coefficient, semantic_score, total_score, selected_segments, selected_features]
+      properties:
+        rule_score: {type: number, minimum: 0, maximum: 100, description: min(100, 参与评分命中权重之和)}
+        semantic_raw: {type: number, minimum: 0, maximum: 100}
+        semantic_coefficient: {type: number, minimum: 0, maximum: 1}
+        semantic_score: {type: number, minimum: 0, maximum: 100}
+        total_score: {type: number, minimum: 0, maximum: 100}
+        selected_segments:
+          type: array
+          items: {type: integer, minimum: 0}
+          description: 最终选中窗口在 segment_results 中的索引。
+        selected_features:
+          type: array
+          items: {type: string}
+      description: semantic_score=semantic_coefficient×semantic_raw；无任何命中时 semantic_score 和 total_score 均为 0。
+    SegmentResult:
+      type: object
+      additionalProperties: false
+      required: [index, global_start, global_end, fraud_intent, speech_features, raw_output]
+      properties:
+        index: {type: integer, minimum: 0}
+        global_start: {type: integer, minimum: 0}
+        global_end: {type: integer, minimum: 1}
+        fraud_intent: {type: string}
+        speech_features: {type: array, items: {type: string}}
+        raw_output: {type: object}
+    ConfigVersions:
+      type: object
+      additionalProperties: false
+      required: [rule_version, rule_release_id, threshold_version, semantic_config_version, transform_dict_version, list_version, retriever_version]
+      properties:
+        rule_version: {$ref: "#/components/schemas/Version"}
+        rule_release_id: {type: string, format: uuid}
+        threshold_version: {$ref: "#/components/schemas/Version"}
+        semantic_config_version: {$ref: "#/components/schemas/Version"}
+        transform_dict_version: {$ref: "#/components/schemas/Version"}
+        list_version: {$ref: "#/components/schemas/Version"}
+        retriever_version: {type: [string, "null"], maxLength: 64}
+    VerificationResult:
+      type: object
+      additionalProperties: false
+      required: [trace_id, trace_token, content_type, mode, fraud_type, total_score, risk_level, rule_score, semantic_score, hits, explanation, degraded, versions, created_at]
+      properties:
+        trace_id: {type: string, format: uuid}
+        trace_token: {type: string, minLength: 32}
+        content_type: {$ref: "#/components/schemas/ContentType"}
+        mode: {$ref: "#/components/schemas/VerifyMode"}
+        fraud_type: {type: string}
+        total_score: {type: number, minimum: 0, maximum: 100}
+        risk_level: {$ref: "#/components/schemas/RiskLevel"}
+        rule_score: {type: number, minimum: 0, maximum: 100}
+        semantic_score: {type: number, minimum: 0, maximum: 100}
+        hits: {type: array, items: {$ref: "#/components/schemas/RuleHit"}}
+        explanation: {type: string}
+        degraded: {$ref: "#/components/schemas/DegradedList"}
+        versions: {$ref: "#/components/schemas/ConfigVersions"}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+    VerificationResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/VerificationResult"}
+    JudgmentTrace:
+      type: object
+      additionalProperties: false
+      required: [trace_id, content_type, verify_mode, original_text, normalized_text, facts, segment_results, hits, score_detail, similar_cases, degraded, llm_raw_output, fraud_type, total_score, risk_level, versions, model_provider, model_name, stage_timings_ms, created_at]
+      properties:
+        trace_id: {type: string, format: uuid}
+        content_type: {$ref: "#/components/schemas/ContentType"}
+        verify_mode: {$ref: "#/components/schemas/VerifyMode"}
+        original_text: {type: string}
+        normalized_text: {type: string}
+        facts: {type: object}
+        segment_results: {type: array, items: {$ref: "#/components/schemas/SegmentResult"}}
+        hits: {type: array, items: {$ref: "#/components/schemas/RuleHit"}}
+        score_detail: {$ref: "#/components/schemas/ScoreDetail"}
+        similar_cases:
+          type: array
+          maxItems: 5
+          items:
+            type: object
+            additionalProperties: false
+            required: [case_id, similarity]
+            properties:
+              case_id: {type: string, pattern: "^C[0-9]+$"}
+              similarity: {type: number, minimum: -1, maximum: 1}
+        degraded: {$ref: "#/components/schemas/DegradedList"}
+        llm_raw_output: {type: [object, "null"]}
+        fraud_type: {type: string}
+        total_score: {type: number, minimum: 0, maximum: 100}
+        risk_level: {$ref: "#/components/schemas/RiskLevel"}
+        versions: {$ref: "#/components/schemas/ConfigVersions"}
+        model_provider: {type: [string, "null"]}
+        model_name: {type: [string, "null"]}
+        stage_timings_ms: {type: object, additionalProperties: {type: number, minimum: 0}}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+    BatchItemResult:
+      type: object
+      additionalProperties: false
+      required: [item_no, content_type, status, trace_id, trace_token, risk_level, total_score, error_code]
+      properties:
+        item_no: {type: integer, minimum: 1}
+        content_type: {$ref: "#/components/schemas/ContentType"}
+        status: {type: string, enum: [succeeded, degraded, failed]}
+        trace_id: {type: [string, "null"], format: uuid}
+        trace_token: {type: [string, "null"], minLength: 32}
+        risk_level: {type: [string, "null"], enum: [安全, 低风险, 中风险, 高风险, null]}
+        total_score: {type: [number, "null"], minimum: 0, maximum: 100}
+        error_code: {type: [string, "null"]}
+      allOf:
+        - if:
+            properties: {status: {const: failed}}
+          then:
+            properties:
+              trace_id: {type: "null"}
+              trace_token: {type: "null"}
+              risk_level: {type: "null"}
+              total_score: {type: "null"}
+              error_code: {type: string, minLength: 1}
+          else:
+            properties:
+              trace_id: {type: string, format: uuid}
+              trace_token: {type: string, minLength: 32}
+              risk_level: {$ref: "#/components/schemas/RiskLevel"}
+              total_score: {type: number, minimum: 0, maximum: 100}
+    BatchResult:
+      type: object
+      additionalProperties: false
+      required: [batch_id, batch_token, status, item_count, safe_count, low_count, medium_count, high_count, failed_count, items]
+      properties:
+        batch_id: {type: string, format: uuid}
+        batch_token: {type: string, minLength: 32}
+        status: {type: string, enum: [queued, running, completed, completed_with_errors, failed]}
+        item_count: {type: integer, minimum: 1, maximum: 1000}
+        safe_count: {type: integer, minimum: 0}
+        low_count: {type: integer, minimum: 0}
+        medium_count: {type: integer, minimum: 0}
+        high_count: {type: integer, minimum: 0}
+        failed_count: {type: integer, minimum: 0}
+        items: {type: array, maxItems: 1000, items: {$ref: "#/components/schemas/BatchItemResult"}}
+    BatchDetailItem:
+      type: object
+      additionalProperties: false
+      required: [item_no, content_type, status, trace_id, risk_level, total_score, error_code]
+      properties:
+        item_no: {type: integer, minimum: 1}
+        content_type: {$ref: "#/components/schemas/ContentType"}
+        status: {type: string, enum: [succeeded, degraded, failed]}
+        trace_id: {type: [string, "null"], format: uuid}
+        risk_level: {type: [string, "null"], enum: [安全, 低风险, 中风险, 高风险, null]}
+        total_score: {type: [number, "null"], minimum: 0, maximum: 100}
+        error_code: {type: [string, "null"]}
+      allOf:
+        - if:
+            properties: {status: {const: failed}}
+          then:
+            properties:
+              trace_id: {type: "null"}
+              risk_level: {type: "null"}
+              total_score: {type: "null"}
+              error_code: {type: string, minLength: 1}
+          else:
+            properties:
+              trace_id: {type: string, format: uuid}
+              risk_level: {$ref: "#/components/schemas/RiskLevel"}
+              total_score: {type: number, minimum: 0, maximum: 100}
+    BatchDetail:
+      type: object
+      additionalProperties: false
+      required: [batch_id, status, item_count, safe_count, low_count, medium_count, high_count, failed_count, items]
+      properties:
+        batch_id: {type: string, format: uuid}
+        status: {type: string, enum: [queued, running, completed, completed_with_errors, failed]}
+        item_count: {type: integer, minimum: 1, maximum: 1000}
+        safe_count: {type: integer, minimum: 0}
+        low_count: {type: integer, minimum: 0}
+        medium_count: {type: integer, minimum: 0}
+        high_count: {type: integer, minimum: 0}
+        failed_count: {type: integer, minimum: 0}
+        items: {type: array, maxItems: 1000, items: {$ref: "#/components/schemas/BatchDetailItem"}}
+    ExplanationRecord:
+      type: object
+      additionalProperties: false
+      required: [explanation_id, trace_id, view, content, source, citation_status, model_provider, model_name, created_at]
+      properties:
+        explanation_id: {type: string, format: uuid}
+        trace_id: {type: string, format: uuid}
+        view: {type: string, enum: [user, technical]}
+        content: {type: string, minLength: 1}
+        source: {type: string, enum: [template, llm]}
+        citation_status: {type: string, enum: [not_checked, passed, fallback]}
+        model_provider: {type: [string, "null"]}
+        model_name: {type: [string, "null"]}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+    CaseInput:
+      type: object
+      additionalProperties: false
+      required: [fraud_type, title, content, advice, source_url, status]
+      properties:
+        fraud_type: {type: string, minLength: 1, maxLength: 64}
+        title: {type: string, minLength: 1, maxLength: 255}
+        content: {type: string, minLength: 1}
+        advice: {type: string, minLength: 1}
+        source_url: {type: string, format: uri, minLength: 1}
+        status: {type: string, enum: [draft, published, archived]}
+    CaseUpdate:
+      type: object
+      additionalProperties: false
+      required: [revision, fraud_type, title, content, advice, source_url, status]
+      properties:
+        revision: {type: integer, minimum: 1}
+        fraud_type: {type: string, minLength: 1, maxLength: 64}
+        title: {type: string, minLength: 1, maxLength: 255}
+        content: {type: string, minLength: 1}
+        advice: {type: string, minLength: 1}
+        source_url: {type: string, format: uri, minLength: 1}
+        status: {type: string, enum: [draft, published, archived]}
+    RevisionRequest:
+      type: object
+      additionalProperties: false
+      required: [revision]
+      properties:
+        revision: {type: integer, minimum: 1}
+    RuleDefinition:
+      type: object
+      additionalProperties: false
+      required: [fraud_type, weight, conditions, explanation, enabled]
+      properties:
+        fraud_type: {type: string, minLength: 1, maxLength: 64}
+        weight: {type: integer, minimum: 0, maximum: 100}
+        exclusive_group: {type: [string, "null"], maxLength: 64}
+        priority: {type: integer, default: 0}
+        conditions: {type: object, description: 声明式规则 DSL，不接收风险分或阈值覆盖}
+        explanation: {type: string, minLength: 1}
+        enabled: {type: boolean}
+    RuleDraftUpdate:
+      type: object
+      additionalProperties: false
+      required: [revision, fraud_type, weight, conditions, explanation, enabled]
+      properties:
+        revision: {type: integer, minimum: 1}
+        fraud_type: {type: string, minLength: 1, maxLength: 64}
+        weight: {type: integer, minimum: 0, maximum: 100}
+        exclusive_group: {type: [string, "null"], maxLength: 64}
+        priority: {type: integer, default: 0}
+        conditions: {type: object, description: 声明式规则 DSL，不接收风险分或阈值覆盖}
+        explanation: {type: string, minLength: 1}
+        enabled: {type: boolean}
+    RuleReleaseItemInput:
+      type: object
+      additionalProperties: false
+      required: [rule_version_id, enabled]
+      properties:
+        rule_version_id: {type: string, format: uuid}
+        enabled: {type: boolean}
+    RuleReleaseCreate:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items: {$ref: "#/components/schemas/RuleReleaseItemInput"}
+      description: items 必须描述完整目标规则集合，而非仅本次改动的规则。
+    ActivationRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_active_version]
+      properties:
+        expected_active_version: {type: [string, "null"], minLength: 1, maxLength: 64}
+    ConflictResolution:
+      type: object
+      additionalProperties: false
+      required: [resolution, note]
+      properties:
+        resolution: {type: string, enum: [fixed, accepted_risk, false_positive]}
+        note: {type: string, minLength: 1, maxLength: 2000}
+    ListEntryInput:
+      type: object
+      additionalProperties: false
+      required: [entry_type, normalized_value, list_type, source]
+      properties:
+        entry_type: {type: string, enum: [phone, domain, ip]}
+        normalized_value: {type: string, minLength: 1}
+        list_type: {type: string, enum: [blacklist, whitelist]}
+        source: {type: string, minLength: 1}
+    ListDraftUpdate:
+      type: object
+      additionalProperties: false
+      required: [revision, entries]
+      properties:
+        revision: {type: integer, minimum: 1}
+        entries: {type: array, items: {$ref: "#/components/schemas/ListEntryInput"}}
+    ThresholdConfigInput:
+      type: object
+      additionalProperties: false
+      required: [low_min, medium_min, high_min]
+      properties:
+        low_min: {type: number, exclusiveMinimum: 0, maximum: 100}
+        medium_min: {type: number, exclusiveMinimum: 0, maximum: 100}
+        high_min: {type: number, exclusiveMinimum: 0, maximum: 100}
+      description: 服务端强制 low_min < medium_min < high_min。
+    SemanticConfigEntryInput:
+      type: object
+      additionalProperties: false
+      required: [fraud_type, feature_key, speech_features, raw_score]
+      properties:
+        fraud_type: {type: string, minLength: 1, maxLength: 64}
+        feature_key: {type: string, minLength: 1}
+        speech_features: {type: array, items: {type: string, minLength: 1}}
+        raw_score: {type: number, minimum: 0, maximum: 100}
+    SemanticConfigInput:
+      type: object
+      additionalProperties: false
+      required: [semantic_coefficient, entries]
+      properties:
+        semantic_coefficient: {type: number, minimum: 0, maximum: 1}
+        entries: {type: array, items: {$ref: "#/components/schemas/SemanticConfigEntryInput"}}
+    TransformEntryInput:
+      type: object
+      additionalProperties: false
+      required: [pattern, replacement, match_order, enabled]
+      properties:
+        pattern: {type: string, minLength: 1}
+        replacement: {type: string, minLength: 1}
+        match_order: {type: integer, minimum: 0}
+        enabled: {type: boolean}
+    TransformDictionaryUpdate:
+      type: object
+      additionalProperties: false
+      required: [revision, entries]
+      properties:
+        revision: {type: integer, minimum: 1}
+        entries: {type: array, items: {$ref: "#/components/schemas/TransformEntryInput"}}
+    FeedbackCreate:
+      type: object
+      additionalProperties: false
+      required: [trace_id, kind]
+      properties:
+        trace_id: {type: string, format: uuid}
+        kind: {type: string, enum: [false_positive, false_negative]}
+        note: {type: string, maxLength: 2000}
+    AttackSampleInput:
+      type: object
+      additionalProperties: false
+      required: [sample_key, content_type, content, fraud_type]
+      properties:
+        sample_key: {type: string, minLength: 1, maxLength: 128}
+        content_type: {$ref: "#/components/schemas/ContentType"}
+        content: {type: string, minLength: 1}
+        fraud_type: {type: string, minLength: 1, maxLength: 64}
+        origin_sample_id: {type: [string, "null"], format: uuid}
+    SampleSetCreate:
+      type: object
+      additionalProperties: false
+      required: [name, kind, samples]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 128}
+        kind: {type: string, enum: [original, variant, injection, mixed]}
+        origin_set_version: {type: [string, "null"], maxLength: 64}
+        samples:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items: {$ref: "#/components/schemas/AttackSampleInput"}
+    VariantRequest:
+      type: object
+      additionalProperties: false
+      required: [methods]
+      properties:
+        methods:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: {type: string, enum: [character, semantic, splice]}
+        variants_per_sample: {type: integer, minimum: 1, maximum: 20, default: 1}
+        seed: {type: integer, minimum: 0, description: 仅控制确定性字符变体，不改变风险判定}
+    InjectionRequest:
+      type: object
+      additionalProperties: false
+      required: [injection_types]
+      properties:
+        injection_types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: {type: string, minLength: 1, maxLength: 64}
+        injections_per_sample: {type: integer, minimum: 1, maximum: 20, default: 1}
+    ExperimentManifest:
+      type: object
+      additionalProperties: false
+      required: [sample_set_version, verify_mode, experiment_mode, rule_version, threshold_version, semantic_config_version, transform_dict_version, list_version, retriever_version, model_provider, model_name, defense_flag]
+      properties:
+        sample_set_version: {$ref: "#/components/schemas/Version"}
+        verify_mode: {$ref: "#/components/schemas/VerifyMode"}
+        experiment_mode: {type: string, enum: [pure, hybrid, original, variant, defense_off, defense_on, single]}
+        rule_version: {$ref: "#/components/schemas/Version"}
+        threshold_version: {$ref: "#/components/schemas/Version"}
+        semantic_config_version: {$ref: "#/components/schemas/Version"}
+        transform_dict_version: {$ref: "#/components/schemas/Version"}
+        list_version: {$ref: "#/components/schemas/Version"}
+        retriever_version: {type: [string, "null"], minLength: 1, maxLength: 64}
+        model_provider: {type: [string, "null"], minLength: 1, maxLength: 64}
+        model_name: {type: [string, "null"], minLength: 1, maxLength: 128}
+        defense_flag: {type: boolean}
+    ReplayCreate:
+      type: object
+      additionalProperties: false
+      required: [experiment_type, manifest]
+      properties:
+        experiment_type: {type: string, const: ad_hoc}
+        manifest: {$ref: "#/components/schemas/AdHocManifest"}
+    AdHocManifest:
+      allOf:
+        - $ref: "#/components/schemas/ExperimentManifest"
+        - type: object
+          properties:
+            experiment_mode: {const: single}
+    ExperimentArmInput:
+      type: object
+      additionalProperties: false
+      required: [arm_role, manifest]
+      properties:
+        arm_role: {type: string, enum: [pure, hybrid, original, variant, defense_off, defense_on]}
+        manifest: {$ref: "#/components/schemas/ExperimentManifest"}
+    E3PureArm:
+      allOf:
+        - $ref: "#/components/schemas/ExperimentArmInput"
+        - properties:
+            arm_role: {const: pure}
+            manifest:
+              allOf:
+                - $ref: "#/components/schemas/ExperimentManifest"
+                - properties: {experiment_mode: {const: pure}}
+    E3HybridArm:
+      allOf:
+        - $ref: "#/components/schemas/ExperimentArmInput"
+        - properties:
+            arm_role: {const: hybrid}
+            manifest:
+              allOf:
+                - $ref: "#/components/schemas/ExperimentManifest"
+                - properties: {experiment_mode: {const: hybrid}}
+    E4OriginalArm:
+      allOf:
+        - $ref: "#/components/schemas/ExperimentArmInput"
+        - properties:
+            arm_role: {const: original}
+            manifest:
+              allOf:
+                - $ref: "#/components/schemas/ExperimentManifest"
+                - properties: {experiment_mode: {const: original}}
+    E4VariantArm:
+      allOf:
+        - $ref: "#/components/schemas/ExperimentArmInput"
+        - properties:
+            arm_role: {const: variant}
+            manifest:
+              allOf:
+                - $ref: "#/components/schemas/ExperimentManifest"
+                - properties: {experiment_mode: {const: variant}}
+    E5DefenseOffArm:
+      allOf:
+        - $ref: "#/components/schemas/ExperimentArmInput"
+        - properties:
+            arm_role: {const: defense_off}
+            manifest:
+              allOf:
+                - $ref: "#/components/schemas/ExperimentManifest"
+                - properties:
+                    experiment_mode: {const: defense_off}
+                    defense_flag: {const: false}
+    E5DefenseOnArm:
+      allOf:
+        - $ref: "#/components/schemas/ExperimentArmInput"
+        - properties:
+            arm_role: {const: defense_on}
+            manifest:
+              allOf:
+                - $ref: "#/components/schemas/ExperimentManifest"
+                - properties:
+                    experiment_mode: {const: defense_on}
+                    defense_flag: {const: true}
+    ComparisonCreate:
+      type: object
+      additionalProperties: false
+      required: [experiment_type, arms]
+      properties:
+        experiment_type: {type: string, enum: [E3, E4, E5]}
+        arms:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: {$ref: "#/components/schemas/ExperimentArmInput"}
+      oneOf:
+        - properties:
+            experiment_type: {const: E3}
+            arms:
+              allOf:
+                - contains: {$ref: "#/components/schemas/E3PureArm"}
+                - contains: {$ref: "#/components/schemas/E3HybridArm"}
+        - properties:
+            experiment_type: {const: E4}
+            arms:
+              allOf:
+                - contains: {$ref: "#/components/schemas/E4OriginalArm"}
+                - contains: {$ref: "#/components/schemas/E4VariantArm"}
+        - properties:
+            experiment_type: {const: E5}
+            arms:
+              allOf:
+                - contains: {$ref: "#/components/schemas/E5DefenseOffArm"}
+                - contains: {$ref: "#/components/schemas/E5DefenseOnArm"}
+      description: E3 同集 pure/hybrid；E4 original/variant 以 pair_key 配对；E5 同集且仅 defense_flag 不同。服务端校验其余配置版本一致。
+    ReplayItem:
+      type: object
+      additionalProperties: false
+      required: [replay_item_id, sample_id, trace_id, pair_key, detected, attack_success, output_validation_failed, status, error_code]
+      properties:
+        replay_item_id: {type: string, format: uuid}
+        sample_id: {type: string, format: uuid}
+        trace_id: {type: [string, "null"], format: uuid}
+        pair_key: {type: string, format: uuid, description: 原始项=sample_id；变体项=origin_sample_id}
+        detected: {type: [boolean, "null"]}
+        attack_success: {type: [boolean, "null"]}
+        output_validation_failed: {type: boolean}
+        status: {type: string, enum: [succeeded, degraded, failed]}
+        error_code: {type: [string, "null"], maxLength: 64}
+      allOf:
+        - if:
+            properties: {status: {const: failed}}
+          then:
+            required: [error_code]
+            properties:
+              trace_id: {type: "null"}
+              detected: {type: "null"}
+              attack_success: {type: "null"}
+              error_code: {type: string, minLength: 1, maxLength: 64}
+          else:
+            properties:
+              trace_id: {type: string, format: uuid}
+              detected: {type: boolean}
+              attack_success: {type: [boolean, "null"]}
+    ReplayRun:
+      type: object
+      additionalProperties: false
+      required: [replay_run_id, comparison_id, arm_id, status, total_count, valid_count, detected_count, failed_count, attack_success_count, output_validation_failure_count, items, created_at, finished_at]
+      properties:
+        replay_run_id: {type: string, format: uuid}
+        comparison_id: {type: [string, "null"], format: uuid}
+        arm_id: {type: string, format: uuid}
+        status: {type: string, enum: [queued, running, completed, degraded, failed]}
+        total_count: {type: integer, minimum: 0}
+        valid_count: {type: integer, minimum: 0, description: 有真实判定结果的样本数，是检出率和 ASR 的有效分母}
+        detected_count: {type: integer, minimum: 0}
+        failed_count: {type: integer, minimum: 0}
+        attack_success_count: {type: integer, minimum: 0}
+        output_validation_failure_count: {type: integer, minimum: 0}
+        items: {type: array, items: {$ref: "#/components/schemas/ReplayItem"}}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        finished_at: {type: [string, "null"], format: date-time}
+    ExperimentArm:
+      type: object
+      additionalProperties: false
+      required: [arm_id, arm_role, manifest, replay_run]
+      properties:
+        arm_id: {type: string, format: uuid}
+        arm_role: {type: string, enum: [pure, hybrid, original, variant, defense_off, defense_on, single]}
+        manifest: {$ref: "#/components/schemas/ExperimentManifest"}
+        replay_run:
+          anyOf:
+            - $ref: "#/components/schemas/ReplayRun"
+            - type: "null"
+    ComparisonMetrics:
+      type: object
+      additionalProperties: false
+      properties:
+        recall_by_arm: {type: object, additionalProperties: {type: number, minimum: 0, maximum: 1}}
+        variant_asr: {type: [number, "null"], minimum: 0, maximum: 1}
+        injection_asr_by_arm: {type: object, additionalProperties: {type: number, minimum: 0, maximum: 1}}
+        injection_asr_relative_reduction: {type: [number, "null"]}
+        valid_pair_count: {type: integer, minimum: 0}
+        detected_original_pair_count: {type: integer, minimum: 0}
+      description: 指标由真实 replay_item 计算；失败和缺项不进入有效分母。
+    Comparison:
+      type: object
+      additionalProperties: false
+      required: [comparison_id, experiment_type, status, arms, metrics]
+      properties:
+        comparison_id: {type: string, format: uuid}
+        experiment_type: {type: string, enum: [E3, E4, E5]}
+        status: {type: string, enum: [draft, running, completed, failed]}
+        arms: {type: array, minItems: 2, items: {$ref: "#/components/schemas/ExperimentArm"}}
+        metrics: {$ref: "#/components/schemas/ComparisonMetrics"}
+    BlindspotCell:
+      type: object
+      additionalProperties: false
+      required: [fraud_type, attack_method, total_count, detected_count, detection_rate]
+      properties:
+        fraud_type: {type: string}
+        attack_method: {type: string, enum: [none, character, semantic, splice, injection]}
+        total_count: {type: integer, minimum: 1}
+        detected_count: {type: integer, minimum: 0}
+        detection_rate: {type: number, minimum: 0, maximum: 1, readOnly: true}
+    RuleSuggestionCreate:
+      type: object
+      additionalProperties: false
+      required: [sample_ids]
+      properties:
+        sample_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: {type: string, format: uuid}
+        based_on_rule_id: {type: [string, "null"], pattern: "^R[0-9]+$"}
+    RuleDraft:
+      type: object
+      additionalProperties: false
+      required: [draft_id, source_replay_run_id, source_sample_id, based_on_rule_id, proposed_rule, status, accepted_rule_id, published_rule_version_id]
+      properties:
+        draft_id: {type: string, format: uuid}
+        source_replay_run_id: {type: [string, "null"], format: uuid}
+        source_sample_id: {type: [string, "null"], format: uuid}
+        based_on_rule_id: {type: [string, "null"], pattern: "^R[0-9]+$"}
+        proposed_rule: {$ref: "#/components/schemas/RuleDefinition"}
+        status: {type: string, enum: [pending, accepted, rejected, approved]}
+        accepted_rule_id: {type: [string, "null"], pattern: "^R[0-9]+$"}
+        published_rule_version_id: {type: [string, "null"], format: uuid}
+      allOf:
+        - if:
+            properties: {status: {const: accepted}}
+          then:
+            properties:
+              accepted_rule_id: {type: string, pattern: "^R[0-9]+$"}
+              published_rule_version_id: {type: "null"}
+        - if:
+            properties: {status: {const: approved}}
+          then:
+            properties:
+              accepted_rule_id: {type: string, pattern: "^R[0-9]+$"}
+              published_rule_version_id: {type: string, format: uuid}
+        - if:
+            properties: {status: {enum: [pending, rejected]}}
+          then:
+            properties:
+              accepted_rule_id: {type: "null"}
+              published_rule_version_id: {type: "null"}
+    RuleDraftReview:
+      type: object
+      additionalProperties: false
+      required: [decision]
+      properties:
+        decision: {type: string, enum: [accept, reject]}
+        review_note: {type: string, maxLength: 2000}
+    CampaignCreate:
+      type: object
+      additionalProperties: false
+      required: [goal, experiment_type, arms]
+      properties:
+        goal: {type: string, minLength: 1, maxLength: 2000}
+        experiment_type: {type: string, enum: [E3, E4, E5]}
+        arms:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: {$ref: "#/components/schemas/ExperimentArmInput"}
+      oneOf:
+        - properties:
+            experiment_type: {const: E3}
+            arms:
+              allOf:
+                - contains: {$ref: "#/components/schemas/E3PureArm"}
+                - contains: {$ref: "#/components/schemas/E3HybridArm"}
+        - properties:
+            experiment_type: {const: E4}
+            arms:
+              allOf:
+                - contains: {$ref: "#/components/schemas/E4OriginalArm"}
+                - contains: {$ref: "#/components/schemas/E4VariantArm"}
+        - properties:
+            experiment_type: {const: E5}
+            arms:
+              allOf:
+                - contains: {$ref: "#/components/schemas/E5DefenseOffArm"}
+                - contains: {$ref: "#/components/schemas/E5DefenseOnArm"}
+      description: 活动预算由服务端配置，客户端不能通过 max_rounds/max_samples 或模型参数提高预算。
+    AgentSessionCreate:
+      type: object
+      additionalProperties: false
+      properties:
+        title: {type: string, maxLength: 128}
+      description: 不接收 owner_id；匿名或登录身份由凭据决定。
+    AgentSession:
+      type: object
+      additionalProperties: false
+      required: [session_id, session_token, status, expires_at, created_at]
+      properties:
+        session_id: {type: string, format: uuid}
+        session_token: {type: [string, "null"], minLength: 32, description: 仅匿名会话创建时返回一次}
+        status: {type: string, enum: [active, expired, closed]}
+        expires_at: {$ref: "#/components/schemas/DateTime"}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+    VerificationContent:
+      type: object
+      additionalProperties: false
+      required: [content_type, content]
+      properties:
+        content_type: {$ref: "#/components/schemas/ContentType"}
+        content: {type: string, minLength: 1, maxLength: 100000}
+      description: 显式正文由后端保存并签发 content_ref；口语候选 span 另需用户确认。
+    AgentMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [message]
+      properties:
+        message: {type: string, minLength: 1, maxLength: 20000}
+        verification_content: {$ref: "#/components/schemas/VerificationContent"}
+        mode: {$ref: "#/components/schemas/VerifyMode"}
+    ContentConfirmation:
+      type: object
+      additionalProperties: false
+      required: [confirmed]
+      properties:
+        confirmed: {type: boolean}
+      description: 不允许模型或客户端在此替换正文、类型或 span。
+    CaseReference:
+      type: object
+      additionalProperties: false
+      required: [case_id, title, advice, source_url]
+      properties:
+        case_id: {type: string, pattern: "^C[0-9]+$"}
+        title: {type: string}
+        advice: {type: string}
+        source_url: {type: string, format: uri}
+    AgentVerificationResult:
+      type: object
+      additionalProperties: false
+      required: [trace_id, risk_level, total_score, degraded]
+      properties:
+        trace_id: {type: string, format: uuid}
+        risk_level: {$ref: "#/components/schemas/RiskLevel"}
+        total_score: {type: number, minimum: 0, maximum: 100}
+        degraded: {$ref: "#/components/schemas/DegradedList"}
+    AgentMessageResponse:
+      type: object
+      additionalProperties: false
+      required: [run_id, answer, verification_results, case_references, pending_contents, degraded]
+      properties:
+        run_id: {type: string, format: uuid}
+        answer: {type: string, description: 模型补充说明或后端模板；风险结论由真实工具结果确定}
+        verification_results: {type: array, items: {$ref: "#/components/schemas/AgentVerificationResult"}}
+        case_references: {type: array, items: {$ref: "#/components/schemas/CaseReference"}}
+        pending_contents:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [content_ref, content_type, original_text, span_start, span_end, status]
+            properties:
+              content_ref: {type: string, format: uuid}
+              content_type: {$ref: "#/components/schemas/ContentType"}
+              original_text: {type: string}
+              span_start: {type: [integer, "null"], minimum: 0}
+              span_end: {type: [integer, "null"], minimum: 1}
+              status: {type: string, enum: [pending, confirmed, rejected]}
+        degraded: {$ref: "#/components/schemas/DegradedList"}
+    Page:
+      type: object
+      additionalProperties: false
+      required: [items, total, page, page_size]
+      properties:
+        items: {type: array, items: {type: object}}
+        total: {type: integer, minimum: 0}
+        page: {type: integer, minimum: 1}
+        page_size: {type: integer, minimum: 1, maximum: 100}
+
+    KnowledgeType:
+      type: object
+      additionalProperties: false
+      required: [code, display_name, case_count]
+      properties:
+        code: {type: string}
+        display_name: {type: string}
+        case_count: {type: integer, minimum: 1}
+    KnowledgeTypeList:
+      type: array
+      items: {$ref: "#/components/schemas/KnowledgeType"}
+    Case:
+      type: object
+      additionalProperties: false
+      required: [case_id, revision, fraud_type, title, content, advice, source_url, status, created_at, updated_at]
+      properties:
+        case_id: {type: string, pattern: "^C[0-9]+$"}
+        revision: {type: integer, minimum: 1}
+        fraud_type: {type: string}
+        title: {type: string, minLength: 1}
+        content: {type: string, minLength: 1}
+        advice: {type: string, minLength: 1}
+        source_url: {type: string, format: uri}
+        status: {type: string, enum: [draft, published, archived]}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        updated_at: {$ref: "#/components/schemas/DateTime"}
+    Rule:
+      type: object
+      additionalProperties: false
+      required: [rule_id, revision, current_version_id, draft, enabled, deleted_at]
+      properties:
+        rule_id: {type: string, pattern: "^R[0-9]+$"}
+        revision: {type: integer, minimum: 1}
+        current_version_id: {type: [string, "null"], format: uuid}
+        draft:
+          anyOf:
+            - $ref: "#/components/schemas/RuleDefinition"
+            - type: "null"
+        enabled: {type: boolean}
+        deleted_at: {type: [string, "null"], format: date-time}
+    RuleVersion:
+      type: object
+      additionalProperties: false
+      required: [rule_version_id, rule_id, version_no, fraud_type, weight, exclusive_group, priority, conditions, explanation, enabled, created_at]
+      properties:
+        rule_version_id: {type: string, format: uuid}
+        rule_id: {type: string, pattern: "^R[0-9]+$"}
+        version_no: {type: integer, minimum: 1}
+        fraud_type: {type: string}
+        weight: {type: integer, minimum: 0, maximum: 100}
+        exclusive_group: {type: [string, "null"]}
+        priority: {type: integer}
+        conditions: {type: object}
+        explanation: {type: string, minLength: 1}
+        enabled: {type: boolean}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+    RuleReleaseItem:
+      type: object
+      additionalProperties: false
+      required: [rule_id, rule_version_id, enabled]
+      properties:
+        rule_id: {type: string, pattern: "^R[0-9]+$"}
+        rule_version_id: {type: string, format: uuid}
+        enabled: {type: boolean}
+    RuleRelease:
+      type: object
+      additionalProperties: false
+      required: [version, release_id, status, items, created_at, activated_at]
+      properties:
+        version: {$ref: "#/components/schemas/Version"}
+        release_id: {type: string, format: uuid}
+        status: {type: string, enum: [draft, active, archived]}
+        items: {type: array, minItems: 1, items: {$ref: "#/components/schemas/RuleReleaseItem"}}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        activated_at: {type: [string, "null"], format: date-time}
+    RuleConflict:
+      type: object
+      additionalProperties: false
+      required: [conflict_id, release_version, rule_id_a, rule_id_b, conflict_type, analysis_status, details, resolution, created_at, resolved_at]
+      properties:
+        conflict_id: {type: string, format: uuid}
+        release_version: {$ref: "#/components/schemas/Version"}
+        rule_id_a: {type: string, pattern: "^R[0-9]+$"}
+        rule_id_b: {type: string, pattern: "^R[0-9]+$"}
+        conflict_type: {type: string, enum: [shadow, redundancy, overlap]}
+        analysis_status: {type: string, enum: [confirmed, needs_review, resolved]}
+        details: {type: object}
+        resolution: {type: [string, "null"], enum: [fixed, accepted_risk, false_positive, null]}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        resolved_at: {type: [string, "null"], format: date-time}
+    ListRelease:
+      type: object
+      additionalProperties: false
+      required: [version, revision, status, entries, created_at, activated_at]
+      properties:
+        version: {$ref: "#/components/schemas/Version"}
+        revision: {type: integer, minimum: 1}
+        status: {type: string, enum: [draft, active, archived]}
+        entries: {type: array, items: {$ref: "#/components/schemas/ListEntryInput"}}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        activated_at: {type: [string, "null"], format: date-time}
+    ThresholdConfig:
+      type: object
+      additionalProperties: false
+      required: [version, thresholds, weights, status, created_at, activated_at]
+      properties:
+        version: {$ref: "#/components/schemas/Version"}
+        thresholds:
+          type: object
+          additionalProperties: false
+          required: [confirm, review]
+          properties:
+            confirm: {type: integer, minimum: 1, maximum: 100}
+            review: {type: integer, minimum: 0, maximum: 100}
+        weights:
+          type: object
+          additionalProperties: false
+          required: [rule, semantic]
+          properties:
+            rule: {type: number, exclusiveMinimum: 0, maximum: 1}
+            semantic: {type: number, exclusiveMinimum: 0, maximum: 1}
+        status: {type: string, enum: [draft, active, archived]}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        activated_at: {type: [string, "null"], format: date-time}
+    SemanticConfig:
+      type: object
+      additionalProperties: false
+      required: [version, enabled, layers, status, created_at, activated_at]
+      properties:
+        version: {$ref: "#/components/schemas/Version"}
+        enabled: {type: boolean}
+        layers:
+          type: object
+          additionalProperties: false
+          properties:
+            fast: {type: boolean, default: true}
+            similarity: {type: boolean, default: true}
+            llm: {type: boolean, default: false}
+        status: {type: string, enum: [draft, active, archived]}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        activated_at: {type: [string, "null"], format: date-time}
+    TransformDictionary:
+      type: object
+      additionalProperties: false
+      required: [revision, entries, version, status, created_at, activated_at]
+      properties:
+        revision: {type: integer, minimum: 1}
+        entries: {type: array, items: {$ref: "#/components/schemas/TransformEntryInput"}}
+        version: {$ref: "#/components/schemas/Version"}
+        status: {type: string, enum: [draft, active, archived]}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        activated_at: {type: [string, "null"], format: date-time}
+    Feedback:
+      type: object
+      additionalProperties: false
+      required: [feedback_id, trace_id, kind, status, note, revision, created_at, handled_at]
+      properties:
+        feedback_id: {type: string, format: uuid}
+        trace_id: {type: string, format: uuid}
+        kind: {type: string, enum: [false_positive, false_negative]}
+        status: {type: string, enum: [pending, resolved]}
+        note: {type: [string, "null"]}
+        revision: {type: integer, minimum: 1}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        handled_at: {type: [string, "null"], format: date-time}
+    DashboardMetric:
+      type: object
+      additionalProperties: false
+      required: [key, count]
+      properties:
+        key: {type: string}
+        count: {type: integer, minimum: 0}
+    DashboardRuleMetric:
+      type: object
+      additionalProperties: false
+      required: [rule_id, matched_count, trace_count, hit_rate]
+      properties:
+        rule_id: {type: string, pattern: "^R[0-9]+$"}
+        matched_count: {type: integer, minimum: 0}
+        trace_count: {type: integer, minimum: 0}
+        hit_rate: {type: number, minimum: 0, maximum: 1}
+    Dashboard:
+      type: object
+      additionalProperties: false
+      required: [start, end, detection_trend, risk_distribution, fraud_type_distribution, rule_hits]
+      properties:
+        start: {$ref: "#/components/schemas/DateTime"}
+        end: {$ref: "#/components/schemas/DateTime"}
+        detection_trend: {type: array, items: {$ref: "#/components/schemas/DashboardMetric"}}
+        risk_distribution: {type: array, items: {$ref: "#/components/schemas/DashboardMetric"}}
+        fraud_type_distribution: {type: array, items: {$ref: "#/components/schemas/DashboardMetric"}}
+        rule_hits: {type: array, items: {$ref: "#/components/schemas/DashboardRuleMetric"}}
+    AuditLog:
+      type: object
+      additionalProperties: false
+      required: [audit_id, actor_user_id, action, resource_type, resource_id, before_value, after_value, created_at]
+      properties:
+        audit_id: {type: string, format: uuid}
+        actor_user_id: {type: string, format: uuid}
+        action: {type: string}
+        resource_type: {type: string}
+        resource_id: {type: string}
+        before_value: {type: [object, "null"]}
+        after_value: {type: [object, "null"]}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+    AttackSample:
+      type: object
+      additionalProperties: false
+      required: [content_type, original_text, attack_text, source_type, expected_fraud_type, expected_label, sample_id, sample_set_version, attack_method, injection_type, content_hash, created_at]
+      properties:
+        content_type: {$ref: "#/components/schemas/ContentType"}
+        original_text: {type: string, minLength: 1}
+        attack_text: {type: string, minLength: 1}
+        source_type: {type: string, enum: [seed, generated]}
+        expected_fraud_type: {type: [string, "null"]}
+        expected_label: {type: boolean}
+        sample_id: {type: string, format: uuid}
+        sample_set_version: {$ref: "#/components/schemas/Version"}
+        attack_method: {type: string, enum: [none, character, semantic, splice, injection]}
+        injection_type: {type: [string, "null"]}
+        content_hash: {type: string, minLength: 64, maxLength: 64}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+    SampleSet:
+      type: object
+      additionalProperties: false
+      required: [version, name, kind, origin_set_version, status, revision, sample_count, created_at, frozen_at]
+      properties:
+        version: {$ref: "#/components/schemas/Version"}
+        name: {type: string}
+        kind: {type: string, enum: [original, variant, injection, mixed]}
+        origin_set_version: {type: [string, "null"], maxLength: 64}
+        status: {type: string, enum: [draft, frozen, archived]}
+        revision: {type: integer, minimum: 1}
+        sample_count: {type: integer, minimum: 0}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        frozen_at: {type: [string, "null"], format: date-time}
+    SampleSetDetail:
+      type: object
+      additionalProperties: false
+      required: [version, name, kind, origin_set_version, status, revision, sample_count, created_at, frozen_at, samples]
+      properties:
+        version: {$ref: "#/components/schemas/Version"}
+        name: {type: string}
+        kind: {type: string, enum: [original, variant, injection, mixed]}
+        origin_set_version: {type: [string, "null"], maxLength: 64}
+        status: {type: string, enum: [draft, frozen, archived]}
+        revision: {type: integer, minimum: 1}
+        sample_count: {type: integer, minimum: 0}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        frozen_at: {type: [string, "null"], format: date-time}
+        samples:
+          allOf:
+            - $ref: "#/components/schemas/Page"
+            - type: object
+              properties:
+                items: {type: array, items: {$ref: "#/components/schemas/AttackSample"}}
+    AttackRound:
+      type: object
+      additionalProperties: false
+      required: [round_id, round_no, status, comparisons, created_at, finished_at]
+      properties:
+        round_id: {type: string, format: uuid}
+        round_no: {type: integer, minimum: 1}
+        status: {type: string, enum: [pending, running, completed, degraded, failed]}
+        comparisons: {type: array, items: {$ref: "#/components/schemas/Comparison"}}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        finished_at: {type: [string, "null"], format: date-time}
+    Campaign:
+      type: object
+      additionalProperties: false
+      required: [campaign_id, goal, status, budget_version, rounds, degraded, created_at, finished_at]
+      properties:
+        campaign_id: {type: string, format: uuid}
+        goal: {type: string}
+        status: {type: string, enum: [draft, running, completed, degraded, failed, cancelled]}
+        budget_version: {type: string}
+        rounds: {type: array, items: {$ref: "#/components/schemas/AttackRound"}}
+        degraded: {$ref: "#/components/schemas/DegradedList"}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        finished_at: {type: [string, "null"], format: date-time}
+    AgentMessage:
+      type: object
+      additionalProperties: false
+      required: [message_id, run_id, role, content_redacted, created_at]
+      properties:
+        message_id: {type: string, format: uuid}
+        run_id: {type: [string, "null"], format: uuid}
+        role: {type: string, enum: [user, assistant]}
+        content_redacted: {type: string}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+    AgentContent:
+      type: object
+      additionalProperties: false
+      required: [content_ref, content_type, original_text, span_start, span_end, status, created_at, confirmed_at]
+      properties:
+        content_ref: {type: string, format: uuid}
+        content_type: {$ref: "#/components/schemas/ContentType"}
+        original_text: {type: string}
+        span_start: {type: [integer, "null"], minimum: 0}
+        span_end: {type: [integer, "null"], minimum: 1}
+        status: {type: string, enum: [pending, confirmed, rejected]}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        confirmed_at: {type: [string, "null"], format: date-time}
+    AgentSessionDetail:
+      type: object
+      additionalProperties: false
+      required: [session_id, status, expires_at, created_at, messages, contents]
+      properties:
+        session_id: {type: string, format: uuid}
+        status: {type: string, enum: [active, expired, closed]}
+        expires_at: {$ref: "#/components/schemas/DateTime"}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        messages: {type: array, items: {$ref: "#/components/schemas/AgentMessage"}}
+        contents: {type: array, items: {$ref: "#/components/schemas/AgentContent"}}
+    AgentToolCall:
+      type: object
+      additionalProperties: false
+      required: [tool_call_id, tool_name, status, trace_id, latency_ms, error_code, created_at, completed_at]
+      properties:
+        tool_call_id: {type: string, format: uuid}
+        tool_name: {type: string, enum: [verify_content, get_trace_summary, search_cases, explain_verification]}
+        status: {type: string, enum: [pending, running, succeeded, degraded, failed]}
+        trace_id: {type: [string, "null"], format: uuid}
+        latency_ms: {type: [integer, "null"], minimum: 0}
+        error_code: {type: [string, "null"]}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        completed_at: {type: [string, "null"], format: date-time}
+    AgentRun:
+      type: object
+      additionalProperties: false
+      required: [run_id, kind, session_id, campaign_id, status, degraded, stage_timings_ms, tool_calls, created_at, finished_at]
+      properties:
+        run_id: {type: string, format: uuid}
+        kind: {type: string, enum: [message, attack]}
+        session_id: {type: [string, "null"], format: uuid}
+        campaign_id: {type: [string, "null"], format: uuid}
+        status: {type: string, enum: [queued, running, succeeded, degraded, failed]}
+        degraded: {$ref: "#/components/schemas/DegradedList"}
+        stage_timings_ms: {type: object, additionalProperties: {type: number, minimum: 0}}
+        tool_calls: {type: array, items: {$ref: "#/components/schemas/AgentToolCall"}}
+        created_at: {$ref: "#/components/schemas/DateTime"}
+        finished_at: {type: [string, "null"], format: date-time}
+    AgentContentResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/AgentContent"}
+    AgentRunResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/AgentRun"}
+    AgentSessionDetailResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/AgentSessionDetail"}
+    AuditLogPageResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/AuditLogPage"}
+    CampaignResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/Campaign"}
+    CaseResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/Case"}
+    CasePageResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/CasePage"}
+    ComparisonResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/Comparison"}
+    DashboardResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/Dashboard"}
+    FeedbackResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/Feedback"}
+    FeedbackPageResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/FeedbackPage"}
+    KnowledgeTypeListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/KnowledgeTypeList"}
+    ListReleaseResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/ListRelease"}
+    ReplayRunResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/ReplayRun"}
+    RuleResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/Rule"}
+    RuleConflictResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/RuleConflict"}
+    RuleConflictPageResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/RuleConflictPage"}
+    RuleDraftResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/RuleDraft"}
+    RuleDraftPageResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/RuleDraftPage"}
+    RulePageResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/RulePage"}
+    RuleReleaseResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/RuleRelease"}
+    RuleReleasePageResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/RuleReleasePage"}
+    RuleVersionResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/RuleVersion"}
+    RuleVersionPageResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/RuleVersionPage"}
+    SampleSetResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/SampleSet"}
+    SampleSetDetailResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/SampleSetDetail"}
+    SampleSetPageResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/SampleSetPage"}
+    SemanticConfigResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/SemanticConfig"}
+    ThresholdConfigResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/ThresholdConfig"}
+    TransformDictionaryResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiSuccess"
+        - type: object
+          properties:
+            data: {$ref: "#/components/schemas/TransformDictionary"}
+    CasePage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: "#/components/schemas/Case"}}
+    RulePage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: "#/components/schemas/Rule"}}
+    RuleVersionPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: "#/components/schemas/RuleVersion"}}
+    RuleReleasePage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: "#/components/schemas/RuleRelease"}}
+    RuleConflictPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: "#/components/schemas/RuleConflict"}}
+    FeedbackPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: "#/components/schemas/Feedback"}}
+    AuditLogPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: "#/components/schemas/AuditLog"}}
+    SampleSetPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: "#/components/schemas/SampleSet"}}
+    RuleDraftPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: "#/components/schemas/RuleDraft"}}
